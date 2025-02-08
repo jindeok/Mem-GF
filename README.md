@@ -1,3 +1,3 @@
-# Turbo-CF
+# Mem-GF
 
-Private repository for the Poly-CF project.
+The source code for Mem-GF 
