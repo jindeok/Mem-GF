@@ -11,36 +11,79 @@ from scipy.sparse.linalg import eigsh # For PGSP
 from sklearn.mixture import GaussianMixture # For HIGSP
 
 class GF_CF:
-    def __init__(self, args, R_norm, D_i, D_i_inv, device, alpha=0.1, k=300):
-        self.args = args
+    def __init__(self, args, R_norm, D_i, D_i_inv, device, alpha=0.1, k=400):
+        self.args   = args
         self.device = device
-        self.alpha = alpha
-        self.k = k
-        self.R_norm = R_norm 
-        self.D_i = D_i
-        self.D_i_inv = D_i_inv
+        self.alpha  = alpha
+        self.k      = k
 
-        # Graph filter computation
-        print("Starts filter computation .. \n")
-        self.P = self.get_similarity_graph()
-        self.ideal_lpf = self.get_ideal_lpf().to(device)
+        self.R_norm = R_norm.to(device)
+        if self.R_norm.is_sparse:
+            self.R_norm_T = self.R_norm.transpose(0, 1).coalesce()
+        else:
+            self.R_norm_T = self.R_norm.transpose(0, 1)
+
+        self.d_i     = self._extract_diag_to_1d(D_i)
+        self.d_i_inv = self._extract_diag_to_1d(D_i_inv)
+
+        print("Starts filter computation with torch.svd_lowrank()...\n")
+        self.VSVT = self._compute_VSVT(self.R_norm, self.k)
+        print("Filter computation done.\n")
+
+    def _extract_diag_to_1d(self, mat):
+        if isinstance(mat, np.ndarray):
+            if mat.ndim == 1:
+                diag_vals = mat
+            elif mat.ndim == 2:
+                diag_vals = np.diag(mat)
+            else:
+                raise ValueError("D_i or D_i_inv has unexpected shape.")
+            return torch.from_numpy(diag_vals).float().to(self.device)
+
+        elif sp.issparse(mat):
+            if isinstance(mat, sp.dia.dia_matrix):
+                diag_vals = mat.diagonal()  # (n_i,)
+                return torch.from_numpy(diag_vals).float().to(self.device)
+            else:
+                diag_vals = mat.diagonal()
+                return torch.from_numpy(diag_vals).float().to(self.device)
+
+        elif isinstance(mat, torch.Tensor):
+            if mat.ndim == 1:
+                return mat.float().to(self.device)
+            elif mat.ndim == 2:
+                return torch.diag(mat).float().to(self.device)
+            else:
+                raise ValueError("D_i or D_i_inv must be 1D or 2D tensor.")
+        else:
+            raise TypeError("D_i / D_i_inv must be np.ndarray, scipy.sparse, or torch.Tensor.")
+
+    def _compute_VSVT(self, R_norm: torch.Tensor, k: int) -> torch.Tensor:
+        if R_norm.is_sparse:
+            R_dense = R_norm.to_dense()
+        else:
+            R_dense = R_norm
+
+        U, S, V = torch.svd_lowrank(R_dense, q=k)
+        S_mat   = torch.diag(S)
+        VS      = V @ S_mat
+        VSVT    = VS @ V.t()  # (n_i x n_i)
+        return VSVT.to(self.device)
 
     def predict_batch(self, r_u: torch.Tensor) -> torch.Tensor:
-        # To reduce memory usage
-        out = r_u.mm(self.P)  # (A) = r_u @ P
-        out.add_(r_u.mm(self.ideal_lpf), alpha=self.alpha)  # (B) = r_u @ ideal_lpf
-        return out
+        if self.R_norm.is_sparse:
+            temp = r_u.mm(self.R_norm_T)  # shape=(b, n_u)
+            out  = temp.mm(self.R_norm)   # shape=(b, n_i)
+        else:
+            out  = r_u @ self.R_norm_T
+            out  = out @ self.R_norm
+        out_ideal_1 = r_u * self.d_i  # shape(b, n_i), broadcasting
+        out_ideal_2 = out_ideal_1.mm(self.VSVT)
+        out_ideal   = out_ideal_2 * self.d_i_inv
 
-    def get_ideal_lpf(self) -> torch.Tensor:
-        R_csc = torch2scipy_csc(self.R_norm)
-        u, s, vt = svds(R_csc, k=self.k)
-        s_mat = np.diag(s)
-        ideal_lpf_np = self.D_i @ vt.T @ s_mat @ vt @ self.D_i_inv
-        # 6) convert numpy -> torch
-        return torch.from_numpy(ideal_lpf_np).float()    
+        out += self.alpha * out_ideal
+        return out
     
-    def get_similarity_graph(self):
-        return torch.sparse.mm(self.R_norm.transpose(0, 1),self.R_norm)
 
 
 class Turbo_CF:
